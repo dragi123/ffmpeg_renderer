@@ -1,88 +1,112 @@
 import os
+import json
 import subprocess
+import tempfile
 from flask import Flask, request, jsonify
+from google.cloud import storage
 
 app = Flask(__name__)
 
-API_KEY = os.environ.get("API_KEY", "")
+# ---------- 기본 엔드포인트 ----------
+@app.get("/")
+def root():
+    return "ffmpeg-renderer up", 200
 
-def check_key(req):
-    # API_KEY를 안 쓰면(빈 값) 인증 없이 통과
-    if not API_KEY:
-        return True
-    return req.headers.get("X-API-Key", "") == API_KEY
 
 @app.get("/health")
 def health():
     return "ok", 200
 
+
+# ---------- 핵심 렌더 엔드포인트 ----------
 @app.post("/render")
 def render():
-    if not check_key(request):
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        # 1️⃣ 요청 JSON 받기
+        data = request.get_json(force=True, silent=True)
 
-    data = request.get_json(force=True) or {}
-    audio = data.get("audio")
-    videos = data.get("videos", [])
-    output = data.get("output")
+        # n8n에서 stringified JSON으로 오는 경우 대비
+        if isinstance(data, str):
+            data = json.loads(data)
 
-    if not audio or not output or not isinstance(videos, list) or len(videos) == 0:
-        return jsonify({"ok": False, "error": "payload must include audio, videos[], output"}), 400
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "Invalid JSON payload"}), 400
 
-    if not audio.startswith("gs://") or not output.startswith("gs://"):
-        return jsonify({"ok": False, "error": "audio/output must be gs://..."}), 400
-    for v in videos:
-        if not isinstance(v, str) or not v.startswith("gs://"):
-            return jsonify({"ok": False, "error": "videos must be gs://... list"}), 400
+        audio = data.get("audio")
+        videos = data.get("videos")
+        output = data.get("output")
 
-    workdir = "/tmp/work"
-    os.makedirs(workdir, exist_ok=True)
+        if not audio or not videos or not output:
+            return jsonify({
+                "ok": False,
+                "error": "payload must include audio, videos[], output"
+            }), 400
 
-    # 1) GCS에서 로컬로 받기
-    local_audio = os.path.join(workdir, "audio.mp3")
-    subprocess.check_call(["gsutil", "-q", "cp", audio, local_audio])
+        if not isinstance(videos, list):
+            return jsonify({
+                "ok": False,
+                "error": "videos must be an array"
+            }), 400
 
-    local_videos = []
-    for i, v in enumerate(videos):
-        p = os.path.join(workdir, f"video_{i}.mp4")
-        subprocess.check_call(["gsutil", "-q", "cp", v, p])
-        local_videos.append(p)
+        # 2️⃣ GCS 클라이언트
+        client = storage.Client()
 
-    # 2) concat 리스트 만들기
-    concat_txt = os.path.join(workdir, "concat.txt")
-    with open(concat_txt, "w", encoding="utf-8") as f:
-        for p in local_videos:
-            f.write(f"file '{p}'\n")
+        def download_gs(gs_path, local_path):
+            bucket_name, blob_name = gs_path.replace("gs://", "").split("/", 1)
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+            blob.download_to_filename(local_path)
 
-    merged = os.path.join(workdir, "merged.mp4")
-    final = os.path.join(workdir, "final.mp4")
+        def upload_gs(local_path, gs_path):
+            bucket_name, blob_name = gs_path.replace("gs://", "").split("/", 1)
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+            blob.upload_from_filename(local_path, content_type="video/mp4")
 
-    # 3) 영상 concat (코덱이 동일하면 copy로 빠르게 합쳐짐)
-    subprocess.check_call([
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", concat_txt,
-        "-c", "copy",
-        merged
-    ])
+        # 3️⃣ 임시 디렉토리에서 작업
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = os.path.join(tmpdir, "audio.mp3")
+            download_gs(audio, audio_path)
 
-    # 4) 오디오 mux (오디오 aac로 인코딩, 영상은 copy)
-    subprocess.check_call([
-        "ffmpeg", "-y",
-        "-i", merged,
-        "-i", local_audio,
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-shortest",
-        final
-    ])
+            video_paths = []
+            for i, v in enumerate(videos):
+                vp = os.path.join(tmpdir, f"video_{i}.mp4")
+                download_gs(v, vp)
+                video_paths.append(vp)
 
-    # 5) 결과 업로드
-    subprocess.check_call(["gsutil", "-q", "cp", final, output])
+            # concat 리스트 파일 생성
+            concat_list = os.path.join(tmpdir, "concat.txt")
+            with open(concat_list, "w") as f:
+                for vp in video_paths:
+                    f.write(f"file '{vp}'\n")
 
-    return jsonify({"ok": True, "output": output, "videoCount": len(videos)}), 200
+            merged_video = os.path.join(tmpdir, "merged.mp4")
+            final_video = os.path.join(tmpdir, "final.mp4")
 
+            # 4️⃣ 영상 concat (재인코딩, 안정 모드)
+            subprocess.check_call([
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", concat_list,
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-pix_fmt", "yuv420p",
+                merged_video
+            ])
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+            # 5️⃣ 오디오 합성
+            subprocess.check_call([
+                "ffmpeg", "-y",
+                "-i", merged_video,
+                "-i", audio_path,
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-shortest",
+                final_video
+            ])
+
+            # 6️⃣ GCS 업로드
+            upload_gs(final_video, output)
+
+        return jsoni
