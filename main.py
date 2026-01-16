@@ -30,7 +30,10 @@ def render():
             data = json.loads(data)
 
         if not isinstance(data, dict):
-            return jsonify({"ok": False, "error": "Invalid JSON payload"}), 400
+            return jsonify({
+                "ok": False,
+                "error": "Invalid JSON payload"
+            }), 400
 
         audio = data.get("audio")
         videos = data.get("videos")
@@ -61,7 +64,10 @@ def render():
             bucket_name, blob_name = gs_path.replace("gs://", "").split("/", 1)
             bucket = client.bucket(bucket_name)
             blob = bucket.blob(blob_name)
-            blob.upload_from_filename(local_path, content_type="video/mp4")
+            blob.upload_from_filename(
+                local_path,
+                content_type="video/mp4"
+            )
 
         # 3️⃣ 임시 디렉토리에서 작업
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -83,7 +89,7 @@ def render():
             merged_video = os.path.join(tmpdir, "merged.mp4")
             final_video = os.path.join(tmpdir, "final.mp4")
 
-            # 4️⃣ 영상 concat (재인코딩, 안정 모드)
+            # 4️⃣ 영상 concat (재인코딩)
             subprocess.check_call([
                 "ffmpeg", "-y",
                 "-f", "concat",
@@ -109,4 +115,30 @@ def render():
             # 6️⃣ GCS 업로드
             upload_gs(final_video, output)
 
-        return jsoni
+        # ✅ 정상 완료 응답
+        return jsonify({
+            "ok": True,
+            "output": output,
+            "videoCount": len(videos)
+        }), 200
+
+    except subprocess.CalledProcessError as e:
+        return jsonify({
+            "ok": False,
+            "error": "ffmpeg failed",
+            "detail": str(e)
+        }), 500
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": "internal error",
+            "detail": str(e)
+        }), 500
+
+
+if __name__ == "__main__":
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8080))
+    )
