@@ -94,9 +94,7 @@ def render():
                 "-f", "concat",
                 "-safe", "0",
                 "-i", concat_list,
-                "-c:v", "libx264",
-                "-preset", "fast",
-                "-pix_fmt", "yuv420p",
+                "-c", "copy",  # 재인코딩 안 하고 그대로 붙이기
                 merged_video
             ])
 
