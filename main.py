@@ -98,14 +98,16 @@ def render():
                 merged_video
             ])
 
-            # 5) 오디오 합성
+            # 5) 오디오 합성 (영상 소리는 완전히 버리고, 내가 준 오디오만 딱 입히기)
             subprocess.check_call([
                 "ffmpeg", "-y",
-                "-i", merged_video,
-                "-i", audio_path,
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-shortest",
+                "-i", merged_video,  # 합쳐진 영상 (입력 0)
+                "-i", audio_path,   # 내가 준 오디오 (입력 1)
+                "-map", "0:v:0",     # 0번 입력(영상)에서 비디오만 가져온다
+                "-map", "1:a:0",     # 1번 입력(오디오)에서 첫 번째 오디오 채널만 가져온다
+                "-c:v", "copy",      # 비디오는 재인코딩 없이 복사
+                "-c:a", "aac",       # 오디오는 aac로 인코딩
+                "-shortest",         # 영상이나 오디오 중 짧은 쪽에 맞춤
                 final_video
             ])
 
