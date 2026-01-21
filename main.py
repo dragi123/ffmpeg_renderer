@@ -260,7 +260,7 @@ def render():
                 debug_scenes.append({
                     "idx": i,
                     "target_sec": round(target_sec, 3),
-                    "raw_sec": round(raw_sec, 3)
+                    "raw_sec": round(raw_sec, 3),
                     "short_by": round(target_sec - raw_sec, 3),
                     "video": videos[i],
                 })
