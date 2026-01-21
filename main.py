@@ -61,22 +61,28 @@ def ffprobe_duration_sec(path: str) -> float:
 
 def normalize_scene(video_in: str, video_out: str, target_sec: float, fps: int):
     """
-    씬 mp4를 target_sec로 "정확히" 맞춘다.
+    씬 mp4를 target_sec로 맞춘다.
     - 길면: trim(-t)
-    - 짧으면: tpad clone으로 마지막 프레임 늘림
-    + 9:16 캔버스 강제(VF_916)
-    + fps 통일
-    + libx264 재인코딩(시간축/메타 안정)
+    - 짧으면:
+        * 아주 조금 부족(<= SMALL_PAD_SEC): 마지막 프레임 미세 pad(tpad clone)
+        * 많이 부족: loop로 채운 뒤 target_sec로 컷
     """
     actual = ffprobe_duration_sec(video_in)
-    tol = 0.03  # 30ms
 
+    # 로그(원인 파악에 도움)
+    # print(f"[scene] in={os.path.basename(video_in)} actual={actual:.3f}s target={target_sec:.3f}s short_by={target_sec-actual:.3f}s", flush=True)
+
+    tol = 0.03  # 30ms
+    SMALL_PAD_SEC = 0.5  # 이 정도까지만 정지 프레임 허용(취향대로 0.3~0.7)
+
+    # 공통 필터: 9:16 + fps 통일
+    vf_base = f"{VF_916},fps={fps}"
+
+    # 거의 동일한 길이라도 안정성을 위해 재인코딩하며 target로 컷
     if abs(actual - target_sec) <= tol:
-        # 그래도 timebase/fps 통일 위해 재인코딩 권장
         run_cmd([
             "ffmpeg", "-y", "-i", video_in,
-            "-vf", VF_916,
-            "-r", str(fps),
+            "-vf", vf_base,
             "-t", f"{target_sec:.3f}",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
@@ -89,28 +95,43 @@ def normalize_scene(video_in: str, video_out: str, target_sec: float, fps: int):
         # Trim
         run_cmd([
             "ffmpeg", "-y", "-i", video_in,
-            "-vf", VF_916,
-            "-r", str(fps),
+            "-vf", vf_base,
             "-t", f"{target_sec:.3f}",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-an",
             video_out
         ])
-    else:
-        # Pad last frame then cut
-        pad_sec = max(0.0, target_sec - actual)
+        return actual
+
+    # 여기부터 actual < target
+    short_by = target_sec - actual
+
+    if short_by <= SMALL_PAD_SEC:
+        # 아주 조금 부족한 건 정지로 미세 보정 (루프보다 자연스러움)
         run_cmd([
             "ffmpeg", "-y", "-i", video_in,
-            "-vf", f"{VF_916},tpad=stop_mode=clone:stop_duration={pad_sec:.3f}",
-            "-r", str(fps),
+            "-vf", f"{vf_base},tpad=stop_mode=clone:stop_duration={short_by:.3f}",
             "-t", f"{target_sec:.3f}",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-an",
             video_out
         ])
+        return actual
 
+    # 많이 부족하면: 무한 루프 입력 후 target_sec로 컷
+    run_cmd([
+        "ffmpeg", "-y",
+        "-stream_loop", "-1",
+        "-i", video_in,
+        "-vf", vf_base,
+        "-t", f"{target_sec:.3f}",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-an",
+        video_out
+    ])
     return actual
 
 
@@ -240,6 +261,8 @@ def render():
                     "idx": i,
                     "target_sec": round(target_sec, 3),
                     "raw_sec": round(raw_sec, 3)
+                    "short_by": round(target_sec - raw_sec, 3),
+                    "video": videos[i],
                 })
 
             # 4) Concat fixed scenes
