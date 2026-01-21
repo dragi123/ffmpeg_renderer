@@ -17,4 +17,5 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 
-CMD ["gunicorn", "-b", "0.0.0.0:8080", "main:app"]
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "main:app", "--workers=1", "--threads=1", "--timeout=600", "--graceful-timeout=600"]
+
