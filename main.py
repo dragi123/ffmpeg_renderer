@@ -13,9 +13,8 @@ app = Flask(__name__)
 # =========================
 TARGET_W = 1080
 TARGET_H = 1920
-TAIL_SEC = 2.0  # 오디오 끝난 뒤 영상 여유(초)
 
-# 9:16 캔버스 강제(왜곡 없이)
+# 9:16 캔버스 강제 (마지막 씬 포함 모든 씬에 적용)
 VF_916 = (
     f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
     f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2"
@@ -59,27 +58,35 @@ def ffprobe_duration_sec(path: str) -> float:
     return float(out)
 
 
-def normalize_scene(video_in: str, video_out: str, target_sec: float, fps: int):
+def normalize_scene(video_in: str, video_out: str, target_sec: float, fps: int, keep_original_duration: bool = False):
     """
-    씬 mp4를 target_sec로 맞춘다.
-    - 길면: trim(-t)
-    - 짧으면:
-        * 아주 조금 부족(<= SMALL_PAD_SEC): 마지막 프레임 미세 pad(tpad clone)
-        * 많이 부족: loop로 채운 뒤 target_sec로 컷
+    씬 mp4 처리 함수
+    - keep_original_duration=True (마지막 씬용): 길이 자르지 않고 포맷(9:16, fps)만 변환
+    - False (일반 씬): target_sec에 맞춰서 Trim 또는 Loop/Pad
     """
     actual = ffprobe_duration_sec(video_in)
-
-    # 로그(원인 파악에 도움)
-    # print(f"[scene] in={os.path.basename(video_in)} actual={actual:.3f}s target={target_sec:.3f}s short_by={target_sec-actual:.3f}s", flush=True)
-
-    tol = 0.03  # 30ms
-    SMALL_PAD_SEC = 0.5  # 이 정도까지만 정지 프레임 허용(취향대로 0.3~0.7)
-
+    
     # 공통 필터: 9:16 + fps 통일
     vf_base = f"{VF_916},fps={fps}"
 
-    # 거의 동일한 길이라도 안정성을 위해 재인코딩하며 target로 컷
-    if abs(actual - target_sec) <= tol:
+    # [Case 1] 마지막 씬: 길이를 건드리지 않고 인코딩만 수행 (Veo3 8초 그대로 사용)
+    if keep_original_duration:
+        run_cmd([
+            "ffmpeg", "-y", "-i", video_in,
+            "-vf", vf_base,
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            video_out
+        ])
+        return actual  # 원본 길이 반환
+
+    # [Case 2] 일반 씬: 시간 맞추기 로직
+    tol = 0.03      # 30ms
+    SMALL_PAD_SEC = 0.5 
+
+    # 2-1. 거의 맞거나, 원본이 더 길면 -> Trim
+    if abs(actual - target_sec) <= tol or actual > target_sec:
         run_cmd([
             "ffmpeg", "-y", "-i", video_in,
             "-vf", vf_base,
@@ -89,26 +96,13 @@ def normalize_scene(video_in: str, video_out: str, target_sec: float, fps: int):
             "-an",
             video_out
         ])
-        return actual
+        return target_sec
 
-    if actual > target_sec:
-        # Trim
-        run_cmd([
-            "ffmpeg", "-y", "-i", video_in,
-            "-vf", vf_base,
-            "-t", f"{target_sec:.3f}",
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-an",
-            video_out
-        ])
-        return actual
-
-    # 여기부터 actual < target
+    # 2-2. 원본이 짧으면 -> Pad or Loop
     short_by = target_sec - actual
 
     if short_by <= SMALL_PAD_SEC:
-        # 아주 조금 부족한 건 정지로 미세 보정 (루프보다 자연스러움)
+        # 미세하게 짧으면 정지 화면(Pad)
         run_cmd([
             "ffmpeg", "-y", "-i", video_in,
             "-vf", f"{vf_base},tpad=stop_mode=clone:stop_duration={short_by:.3f}",
@@ -118,9 +112,9 @@ def normalize_scene(video_in: str, video_out: str, target_sec: float, fps: int):
             "-an",
             video_out
         ])
-        return actual
+        return actual # 사실상 target_sec가 됨
 
-    # 많이 부족하면: 무한 루프 입력 후 target_sec로 컷
+    # 많이 짧으면 Loop
     run_cmd([
         "ffmpeg", "-y",
         "-stream_loop", "-1",
@@ -135,47 +129,6 @@ def normalize_scene(video_in: str, video_out: str, target_sec: float, fps: int):
     return actual
 
 
-def normalize_total_to_audio(merged_in: str, merged_out: str, audio_path: str, fps: int):
-    """
-    concat된 merged 영상을 (오디오 길이 + TAIL_SEC)에 맞춘다.
-    - merged가 길면 trim
-    - 짧으면 pad
-    """
-    audio_sec = ffprobe_duration_sec(audio_path)
-    target_total = audio_sec + TAIL_SEC
-
-    merged_sec = ffprobe_duration_sec(merged_in)
-
-    if merged_sec >= target_total:
-        run_cmd([
-            "ffmpeg", "-y", "-i", merged_in,
-            "-t", f"{target_total:.3f}",
-            "-r", str(fps),
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-an",
-            merged_out
-        ])
-    else:
-        pad_sec = target_total - merged_sec
-        run_cmd([
-            "ffmpeg", "-y", "-i", merged_in,
-            "-vf", f"tpad=stop_mode=clone:stop_duration={pad_sec:.3f}",
-            "-t", f"{target_total:.3f}",
-            "-r", str(fps),
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-an",
-            merged_out
-        ])
-
-    return {
-        "audio_sec": round(audio_sec, 3),
-        "target_total_sec": round(target_total, 3),
-        "merged_sec": round(merged_sec, 3),
-    }
-
-
 # =========================
 # Render endpoint
 # =========================
@@ -184,7 +137,6 @@ def render():
     try:
         data = request.get_json(force=True, silent=True)
 
-        # n8n stringified JSON 대비
         if isinstance(data, str):
             data = json.loads(data)
 
@@ -198,74 +150,67 @@ def render():
         fps = int(data.get("fps", 30))
 
         if not audio or not videos or not output:
-            return jsonify({
-                "ok": False,
-                "error": "payload must include audio, videos[], output"
-            }), 400
+            return jsonify({"ok": False, "error": "payload missing fields"}), 400
 
         if not isinstance(videos, list):
-            return jsonify({"ok": False, "error": "videos must be an array"}), 400
-
-        if not durations_ms or not isinstance(durations_ms, list):
-            return jsonify({"ok": False, "error": "payload must include durations_ms[]"}), 400
+            return jsonify({"ok": False, "error": "videos must be array"}), 400
 
         if len(durations_ms) != len(videos):
-            return jsonify({
-                "ok": False,
-                "error": f"length mismatch: videos={len(videos)} durations_ms={len(durations_ms)}"
-            }), 400
+            return jsonify({"ok": False, "error": "length mismatch"}), 400
 
-        # GCS client
         client = storage.Client()
 
         def download_gs(gs_path: str, local_path: str):
-            if not gs_path.startswith("gs://"):
-                raise ValueError(f"Invalid GCS path: {gs_path}")
             bucket_name, blob_name = gs_path.replace("gs://", "").split("/", 1)
             bucket = client.bucket(bucket_name)
-            blob = bucket.blob(blob_name)
-            blob.download_to_filename(local_path)
+            bucket.blob(blob_name).download_to_filename(local_path)
 
         def upload_gs(local_path: str, gs_path: str):
-            if not gs_path.startswith("gs://"):
-                raise ValueError(f"Invalid GCS path: {gs_path}")
             bucket_name, blob_name = gs_path.replace("gs://", "").split("/", 1)
             bucket = client.bucket(bucket_name)
-            blob = bucket.blob(blob_name)
-            blob.upload_from_filename(local_path, content_type="video/mp4")
+            bucket.blob(blob_name).upload_from_filename(local_path, content_type="video/mp4")
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            # 1) Download audio
+            # 1) Download Audio
             audio_path = os.path.join(tmpdir, "audio.mp3")
             download_gs(audio, audio_path)
 
-            # 2) Download raw videos
-            raw_video_paths = []
-            for i, v in enumerate(videos):
-                vp = os.path.join(tmpdir, f"video_raw_{i}.mp4")
-                download_gs(v, vp)
-                raw_video_paths.append(vp)
-
-            # 3) Normalize each scene by durations_ms
+            # 2) Download Videos & Process
             fixed_video_paths = []
             debug_scenes = []
 
-            for i, (vp, dms) in enumerate(zip(raw_video_paths, durations_ms)):
-                target_sec = float(dms) / 1000.0
-                fixed_vp = os.path.join(tmpdir, f"video_fixed_{i}.mp4")
+            for i, (gs_url, dms) in enumerate(zip(videos, durations_ms)):
+                # 다운로드
+                raw_vp = os.path.join(tmpdir, f"video_raw_{i}.mp4")
+                download_gs(gs_url, raw_vp)
 
-                raw_sec = normalize_scene(vp, fixed_vp, target_sec, fps=fps)
+                # 변환 경로
+                fixed_vp = os.path.join(tmpdir, f"video_fixed_{i}.mp4")
+                
+                # 목표 시간 (ms -> sec)
+                target_sec = float(dms) / 1000.0
+
+                # [핵심 변경] 마지막 씬인지 확인
+                is_last_scene = (i == len(videos) - 1)
+
+                if is_last_scene:
+                    # 마지막 씬은 자르지 않고 원본(8초) 그대로 사용
+                    # target_sec는 무시됨
+                    raw_sec = normalize_scene(raw_vp, fixed_vp, target_sec, fps, keep_original_duration=True)
+                    note = "Last scene: Kept original duration"
+                else:
+                    # 나머지는 자막 시간에 맞춰 칼같이 자름
+                    raw_sec = normalize_scene(raw_vp, fixed_vp, target_sec, fps, keep_original_duration=False)
+                    note = "Normal scene: Trimmed to script"
 
                 fixed_video_paths.append(fixed_vp)
                 debug_scenes.append({
                     "idx": i,
                     "target_sec": round(target_sec, 3),
-                    "raw_sec": round(raw_sec, 3),
-                    "short_by": round(target_sec - raw_sec, 3),
-                    "video": videos[i],
+                    "note": note
                 })
 
-            # 4) Concat fixed scenes
+            # 3) Concat (이어붙이기)
             concat_list = os.path.join(tmpdir, "concat.txt")
             with open(concat_list, "w", encoding="utf-8") as f:
                 for vp in fixed_video_paths:
@@ -284,37 +229,33 @@ def render():
                 merged_video
             ])
 
-            # 5) Ensure total length = audio + 2s
-            merged_fixed = os.path.join(tmpdir, "merged_fixed.mp4")
-            debug_total = normalize_total_to_audio(merged_video, merged_fixed, audio_path, fps=fps)
+            # 4) [삭제됨] normalize_total_to_audio
+            # 이제 영상 전체 길이를 강제로 줄이거나 늘리지 않습니다.
+            # 영상 길이 = (앞선 씬들의 합) + (마지막 씬 8초) 가 되어 오디오보다 자연스럽게 길어집니다.
 
-            # 6) Mux audio only (keep video length; no -shortest to preserve +2s tail)
+            # 5) Muxing (오디오 합치기)
+            # -shortest 옵션 없음: 비디오가 오디오보다 길면, 긴 비디오를 끝까지 다 보여줌
             final_video = os.path.join(tmpdir, "final.mp4")
             run_cmd([
                 "ffmpeg", "-y",
-                "-i", merged_fixed,
-                "-i", audio_path,
+                "-i", merged_video,  # 비디오 (오디오보다 김)
+                "-i", audio_path,    # 오디오 (비디오보다 짧음)
                 "-map", "0:v:0",
                 "-map", "1:a:0",
-                "-c:v", "copy",
+                "-c:v", "copy",      # 재인코딩 없이 병합
                 "-c:a", "aac",
                 "-b:a", "192k",
                 final_video
             ])
 
-            # 7) Upload
+            # 6) Upload
             upload_gs(final_video, output)
 
         return jsonify({
             "ok": True,
             "output": output,
             "videoCount": len(videos),
-            "fps": fps,
-            "debug": {
-                "scenes": debug_scenes,
-                "total": debug_total,
-                "note": "final length is audio + TAIL_SEC; video is 9:16 normalized"
-            }
+            "debug": debug_scenes
         }), 200
 
     except Exception as e:
