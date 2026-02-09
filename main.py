@@ -146,7 +146,13 @@ def render():
         audio = data.get("audio")
         videos = data.get("videos")
         output = data.get("output")
-        durations_ms = data.get("durations_ms")
+        durations_sec = data.get("durations_sec")
+
+        # (선택) 하위호환: 예전에 durations_ms 보내는 경우도 허용
+        if durations_sec is None:
+            durations_ms = data.get("durations_ms")
+            if durations_ms is not None:
+                durations_sec = [float(x) / 1000.0 for x in durations_ms]
         fps = int(data.get("fps", 30))
 
         if not audio or not videos or not output:
@@ -157,6 +163,8 @@ def render():
 
         if len(durations_ms) != len(videos):
             return jsonify({"ok": False, "error": "length mismatch"}), 400
+        if durations_sec is None:
+            return jsonify({"ok": False, "error": "payload missing durations_sec (or durations_ms)"}), 400
 
         client = storage.Client()
 
@@ -179,7 +187,7 @@ def render():
             fixed_video_paths = []
             debug_scenes = []
 
-            for i, (gs_url, dms) in enumerate(zip(videos, durations_ms)):
+            for i, (gs_url, dur) in enumerate(zip(videos, durations_sec)):
                 # 다운로드
                 raw_vp = os.path.join(tmpdir, f"video_raw_{i}.mp4")
                 download_gs(gs_url, raw_vp)
@@ -188,7 +196,7 @@ def render():
                 fixed_vp = os.path.join(tmpdir, f"video_fixed_{i}.mp4")
                 
                 # 목표 시간 (ms -> sec)
-                target_sec = float(dms) / 1000.0
+                target_sec = float(dur)
 
                 # [핵심 변경] 마지막 씬인지 확인
                 is_last_scene = (i == len(videos) - 1)
