@@ -147,13 +147,13 @@ def render():
         videos = data.get("videos")
         output = data.get("output")
         durations_sec = data.get("durations_sec")
+        fps = int(data.get("fps", 30))
 
-        # (선택) 하위호환: 예전에 durations_ms 보내는 경우도 허용
+        # (선택) 하위호환: durations_ms로 들어오면 sec로 변환
         if durations_sec is None:
             durations_ms = data.get("durations_ms")
             if durations_ms is not None:
                 durations_sec = [float(x) / 1000.0 for x in durations_ms]
-        fps = int(data.get("fps", 30))
 
         if not audio or not videos or not output:
             return jsonify({"ok": False, "error": "payload missing fields"}), 400
@@ -161,10 +161,11 @@ def render():
         if not isinstance(videos, list):
             return jsonify({"ok": False, "error": "videos must be array"}), 400
 
-        if len(durations_ms) != len(videos):
-            return jsonify({"ok": False, "error": "length mismatch"}), 400
         if durations_sec is None:
             return jsonify({"ok": False, "error": "payload missing durations_sec (or durations_ms)"}), 400
+
+        if len(durations_sec) != len(videos):
+            return jsonify({"ok": False, "error": "length mismatch"}), 400
 
         client = storage.Client()
 
