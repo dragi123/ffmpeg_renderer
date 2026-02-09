@@ -14,7 +14,6 @@ app = Flask(__name__)
 TARGET_W = 1080
 TARGET_H = 1920
 
-# 9:16 캔버스 강제
 VF_916 = (
     f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
     f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2"
@@ -37,7 +36,6 @@ def health():
 # Helpers
 # =========================
 def run_cmd(cmd: list[str]):
-    """Run subprocess and raise detailed error output if fails."""
     try:
         subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
     except subprocess.CalledProcessError as e:
@@ -58,41 +56,19 @@ def ffprobe_duration_sec(path: str) -> float:
     return float(out)
 
 
-def normalize_scene(
-    video_in: str,
-    video_out: str,
-    target_sec: float,
-    fps: int,
-    keep_original_duration: bool = False
-) -> float:
+def normalize_scene(video_in: str, video_out: str, target_sec: float, fps: int) -> float:
     """
-    씬 mp4 처리 함수
-    - keep_original_duration=True (마지막 씬용): 길이 자르지 않고 포맷(9:16, fps)만 변환
-    - False (일반 씬): target_sec에 맞춰서 Trim 또는 Loop/Pad
+    씬 mp4 처리:
+    - target_sec에 맞춰 Trim 또는 Pad/Loop
+    - 9:16 + fps 통일
     """
     actual = ffprobe_duration_sec(video_in)
-
-    # 공통 필터: 9:16 + fps 통일
     vf_base = f"{VF_916},fps={fps}"
 
-    # [Case 1] 마지막 씬: 길이를 건드리지 않고 인코딩만 수행
-    if keep_original_duration:
-        run_cmd([
-            "ffmpeg", "-y", "-i", video_in,
-            "-vf", vf_base,
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-r", str(fps),
-            "-an",
-            video_out
-        ])
-        return actual  # 원본 길이 반환
-
-    # [Case 2] 일반 씬: 시간 맞추기 로직
-    tol = 0.03        # 30ms
+    tol = 0.03
     SMALL_PAD_SEC = 0.5
 
-    # 2-1. 거의 맞거나, 원본이 더 길면 -> Trim
+    # 길거나 거의 같으면 Trim
     if abs(actual - target_sec) <= tol or actual > target_sec:
         run_cmd([
             "ffmpeg", "-y", "-i", video_in,
@@ -106,11 +82,10 @@ def normalize_scene(
         ])
         return target_sec
 
-    # 2-2. 원본이 짧으면 -> Pad or Loop
+    # 짧으면 Pad / Loop
     short_by = target_sec - actual
 
     if short_by <= SMALL_PAD_SEC:
-        # 미세하게 짧으면 정지 화면(Pad)
         run_cmd([
             "ffmpeg", "-y", "-i", video_in,
             "-vf", f"{vf_base},tpad=stop_mode=clone:stop_duration={short_by:.3f}",
@@ -123,7 +98,6 @@ def normalize_scene(
         ])
         return target_sec
 
-    # 많이 짧으면 Loop
     run_cmd([
         "ffmpeg", "-y",
         "-stream_loop", "-1",
@@ -147,14 +121,12 @@ def cut_audio_segment_to_aac(
     pad_to_sec: float | None = None
 ):
     """
-    audio_in에서 start_sec부터 dur_sec만큼 잘라서 AAC(m4a)로 저장.
-    - pad_to_sec가 주어지면, 결과 오디오를 pad_to_sec 길이가 되도록 무음(apad)로 패딩.
-      (마지막 씬 tail용)
+    audio_in에서 start_sec부터 dur_sec만큼 잘라 AAC(m4a)로 저장.
+    - pad_to_sec가 주어지면, apad로 무음 패딩 후 길이 고정.
     """
     if dur_sec <= 0:
         dur_sec = 0.001
 
-    # mp3 -> m4a(AAC)
     if pad_to_sec is None:
         run_cmd([
             "ffmpeg", "-y",
@@ -167,9 +139,7 @@ def cut_audio_segment_to_aac(
         ])
         return
 
-    # pad_to_sec까지 무음으로 패딩
-    # -af apad=pad_dur=... 로 tail만큼 늘리고,
-    # -t pad_to_sec 로 최종 길이를 고정
+    # pad_to_sec까지 무음 패딩
     tail = max(0.0, pad_to_sec - dur_sec)
     run_cmd([
         "ffmpeg", "-y",
@@ -184,12 +154,28 @@ def cut_audio_segment_to_aac(
     ])
 
 
+def pad_video_tail(video_in: str, video_out: str, extra_sec: float, fps: int) -> float:
+    """
+    video_in 뒤에 extra_sec 만큼 마지막 프레임 복제(tpad)로 여운 추가.
+    """
+    if extra_sec <= 0:
+        run_cmd(["ffmpeg", "-y", "-i", video_in, "-c", "copy", video_out])
+        return ffprobe_duration_sec(video_out)
+
+    run_cmd([
+        "ffmpeg", "-y",
+        "-i", video_in,
+        "-vf", f"fps={fps},tpad=stop_mode=clone:stop_duration={extra_sec:.3f}",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-r", str(fps),
+        "-an",
+        video_out
+    ])
+    return ffprobe_duration_sec(video_out)
+
+
 def mux_video_audio(video_in: str, audio_in: str, out_mp4: str, fps: int):
-    """
-    video_in + audio_in -> out_mp4
-    - 영상은 copy(이미 libx264로 통일된 상태)
-    - 오디오는 aac 유지
-    """
     run_cmd([
         "ffmpeg", "-y",
         "-i", video_in,
@@ -212,10 +198,8 @@ def mux_video_audio(video_in: str, audio_in: str, out_mp4: str, fps: int):
 def render():
     try:
         data = request.get_json(force=True, silent=True)
-
         if isinstance(data, str):
             data = json.loads(data)
-
         if not isinstance(data, dict):
             return jsonify({"ok": False, "error": "Invalid JSON payload"}), 400
 
@@ -225,7 +209,13 @@ def render():
         durations_sec = data.get("durations_sec")
         fps = int(data.get("fps", 30))
 
-        # (선택) 하위호환: durations_ms로 들어오면 sec로 변환
+        # 마지막 여운(영상만 늘림). 기본 2초
+        tail_extra_sec = float(data.get("tail_extra_sec", 2.0))
+
+        # 마지막 씬에서 남은 오디오를 "전부" 가져올지 (기본 True)
+        last_audio_take_rest = bool(data.get("last_audio_take_rest", True))
+
+        # 하위호환
         if durations_sec is None:
             durations_ms = data.get("durations_ms")
             if durations_ms is not None:
@@ -233,15 +223,15 @@ def render():
 
         if not audio or not videos or not output:
             return jsonify({"ok": False, "error": "payload missing fields"}), 400
-
         if not isinstance(videos, list):
             return jsonify({"ok": False, "error": "videos must be array"}), 400
-
         if durations_sec is None:
             return jsonify({"ok": False, "error": "payload missing durations_sec (or durations_ms)"}), 400
-
         if len(durations_sec) != len(videos):
             return jsonify({"ok": False, "error": "length mismatch"}), 400
+
+        # 문자열 섞여 와도 안전 처리
+        durations_sec = [float(x) for x in durations_sec]
 
         client = storage.Client()
 
@@ -259,60 +249,53 @@ def render():
             # 1) Download Audio
             audio_path = os.path.join(tmpdir, "audio.mp3")
             download_gs(audio, audio_path)
-
-            # 오디오 총 길이 (안전장치)
             audio_total_sec = ffprobe_duration_sec(audio_path)
 
-            # 2) Process each scene:
-            #    - video normalize (target or keep last original duration)
-            #    - cut audio segment by cumulative timeline
-            #    - mux into seg_i.mp4
             seg_paths = []
             debug_scenes = []
 
-            cur_start = 0.0  # 누적 오디오 타임라인 시작점
+            cur_start = 0.0
+            sum_script = sum(durations_sec)
 
             for i, (gs_url, dur) in enumerate(zip(videos, durations_sec)):
                 target_sec = float(dur)
                 is_last = (i == len(videos) - 1)
 
-                # 다운로드
                 raw_vp = os.path.join(tmpdir, f"video_raw_{i}.mp4")
                 download_gs(gs_url, raw_vp)
 
-                # 비디오 정규화
+                # 2) 비디오를 target에 맞춤
                 fixed_vp = os.path.join(tmpdir, f"video_fixed_{i}.mp4")
+                video_sec = normalize_scene(raw_vp, fixed_vp, target_sec, fps)
 
-                if is_last:
-                    # 마지막 씬: 길이는 유지(예: Veo의 8초 그대로)
-                    video_sec = normalize_scene(
-                        raw_vp, fixed_vp, target_sec, fps, keep_original_duration=True
-                    )
-                else:
-                    # 일반 씬: target_sec에 맞춤
-                    video_sec = normalize_scene(
-                        raw_vp, fixed_vp, target_sec, fps, keep_original_duration=False
-                    )
+                # 마지막이면 tail만큼 영상 늘림(오디오는 그대로)
+                if is_last and tail_extra_sec > 0:
+                    fixed_tail = os.path.join(tmpdir, f"video_fixed_tail_{i}.mp4")
+                    video_sec = pad_video_tail(fixed_vp, fixed_tail, tail_extra_sec, fps)
+                    fixed_vp = fixed_tail
 
-                # 오디오 잘라오기 (누적 시작점 기준)
-                # 남은 오디오보다 길면 캡 (안전)
+                # 3) 오디오 구간 계산
                 remaining = max(0.0, audio_total_sec - cur_start)
-                audio_seg_sec = min(target_sec, remaining)
+
+                if is_last and last_audio_take_rest:
+                    # 마지막 씬은 남은 오디오를 전부 가져오기 (오디오 절대 잘림 방지)
+                    audio_seg_sec = remaining
+                else:
+                    audio_seg_sec = min(target_sec, remaining)
 
                 audio_seg = os.path.join(tmpdir, f"audio_seg_{i}.m4a")
 
+                # 마지막 씬: 영상이 더 길면 무음 패딩해서 video_sec 길이로 맞춤
                 if is_last:
-                    # 마지막 씬: 오디오를 target만큼(또는 남은만큼) 가져오고
-                    #          영상이 더 길면 무음으로 패딩해서 video_sec까지 채움
                     cut_audio_segment_to_aac(
                         audio_in=audio_path,
                         audio_out=audio_seg,
                         start_sec=cur_start,
                         dur_sec=audio_seg_sec,
-                        pad_to_sec=video_sec  # <- 여기서 tail(무음) 처리
+                        pad_to_sec=video_sec
                     )
+                    note = "Last: took rest audio; padded to video with silence"
                 else:
-                    # 일반 씬: 그냥 target 길이만큼 (정확히 컷 전환 맞춤)
                     cut_audio_segment_to_aac(
                         audio_in=audio_path,
                         audio_out=audio_seg,
@@ -320,8 +303,8 @@ def render():
                         dur_sec=audio_seg_sec,
                         pad_to_sec=None
                     )
+                    note = "Normal: cut audio to target"
 
-                # 씬별 mux 결과
                 seg_out = os.path.join(tmpdir, f"seg_{i}.mp4")
                 mux_video_audio(fixed_vp, audio_seg, seg_out, fps)
                 seg_paths.append(seg_out)
@@ -333,21 +316,19 @@ def render():
                     "target_script_sec": round(target_sec, 3),
                     "audio_cut_sec": round(audio_seg_sec, 3),
                     "video_final_sec": round(video_sec, 3),
-                    "note": "Last scene kept video duration; audio padded with silence" if is_last else "Scene muxed to script duration"
+                    "note": note
                 })
 
-                # 다음 씬 시작점 업데이트: "대본 기준" 누적으로 이동
-                # (컷 전환 기준을 스크립트 타임라인으로 고정)
+                # 컷 전환 기준 타임라인 이동
                 cur_start += target_sec
 
-            # 3) Concat segments (seg_i.mp4 이어붙이기)
+            # 4) Concat segments
             concat_list = os.path.join(tmpdir, "concat.txt")
             with open(concat_list, "w", encoding="utf-8") as f:
                 for vp in seg_paths:
                     f.write(f"file '{vp}'\n")
 
             final_video = os.path.join(tmpdir, "final.mp4")
-            # seg들은 codec/param 통일 상태라 -c copy로 빠르게 concat 가능
             run_cmd([
                 "ffmpeg", "-y",
                 "-f", "concat",
@@ -357,13 +338,16 @@ def render():
                 final_video
             ])
 
-            # 4) Upload
             upload_gs(final_video, output)
 
         return jsonify({
             "ok": True,
             "output": output,
             "videoCount": len(videos),
+            "audio_total_sec": round(audio_total_sec, 3),
+            "sum_script_sec": round(sum_script, 3),
+            "tail_extra_sec": round(tail_extra_sec, 3),
+            "last_audio_take_rest": last_audio_take_rest,
             "debug": debug_scenes
         }), 200
 
